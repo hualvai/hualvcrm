@@ -1,4 +1,4 @@
-# Hualv CRM 外贸客户管理软件原型交付
+# Hualv CRM B2B外贸工作台
 ## WhatsApp 集成
 
 CRM 的 `WhatsApp` 页面加载仓库内的独立服务 `whatsapp-plugin/`。该目录从已验收的
