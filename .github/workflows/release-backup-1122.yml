@@ -1,0 +1,132 @@
+# =============================================================
+# GoodJob CRM 镜像自动发布工作流（GitHub Actions）
+# =============================================================
+# 【作用】
+#   打 v* 版本标签推送到 GitHub 后，自动在 GitHub 云端机器上完成：
+#   ① 安装依赖（npm ci）→ ② 编译构建（npm run build）
+#   → ③ 构建 backend / communication / gateway 三件套 Docker 镜像
+#   → ④ 推送到阿里云 ACR（香港）个人仓库
+#
+# 【镜像命名规则】
+#   <ACR_REGISTRY>/<ACR_NAMESPACE>/backend:<版本>
+#   <ACR_REGISTRY>/<ACR_NAMESPACE>/communication:<版本>
+#   <ACR_REGISTRY>/<ACR_NAMESPACE>/gateway:<版本>
+#   （版本号取自标签，如标签 v1.8.0 → 镜像版本 1.8.0；同时额外打一个 latest）
+#
+# 【凭据来源】全部从 GitHub 仓库 Secrets 加密读取（Settings → Secrets and variables → Actions）：
+#   ACR_REGISTRY  —— 阿里云 ACR 地址，如 crpi-xxxx.cn-hongkong.personal.cr.aliyuncs.com
+#   ACR_NAMESPACE —— 命名空间名（hualvai）
+#   ACR_USERNAME  —— ACR 用户名
+#   ACR_PASSWORD  —— ACR 固定密码
+#   明文凭据不出现在本文件中，安全合规。
+#
+# 【日常用法】
+#   代码推送后打标签：
+#     git tag v1.8.0 && git push origin v1.8.0
+#   然后到 GitHub 仓库页 → Actions 标签页看构建日志，全绿即镜像已入库，
+#   服务器端按《发版操作手册》改版本号 + 宝塔编排点"重建"即可完成发版。 
+# =============================================================
+
+name: Release Images
+
+# 触发条件：只对 v 开头的标签生效（普通 push / PR 不会触发，避免无谓消耗构建时长）
+on:
+  push:
+    tags:
+      - "v*"
+
+# 最小权限原则：构建流程只需要读代码
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    # GitHub 免费提供的云端构建机器，不占用你的服务器任何资源
+    runs-on: ubuntu-latest
+    # 40 分钟兜底超时：正常构建 10-20 分钟，超过说明卡死，直接报错不无限等待
+    timeout-minutes: 40
+    steps:
+      # ---- 第 1 步：拉取仓库源码 ----
+      - name: Checkout（拉取源码）
+        uses: actions/checkout@v4
+
+      # ---- 第 2 步：安装 Node.js 22（与官方构建脚本 build-in-docker.sh 保持同版本）----
+      - name: Setup Node.js 22（安装 Node 22）
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # ---- 第 3 步：安装依赖并编译 ----
+      # 与官方 build-in-docker.sh 完全一致的三条命令：
+      #   1) 根目录 npm ci —— 按 package-lock.json 精确安装依赖（不用 npm install，保证可复现）
+      #   2) whatsapp-plugin 子目录依赖（communication 镜像需要）
+      #   3) npm run build —— 产出 backend/dist、frontend/dist、whatsapp-plugin/dist 等
+      # 环境变量说明：
+      #   PUPPETEER_SKIP_DOWNLOAD / SKIP_CHROMIUM_DOWNLOAD —— 跳过无头浏览器下载（CI 内不需要，省 300MB+）
+      #   NPM_CONFIG_* —— 关闭 npm 的更新提示与赞助广告，保持日志干净
+      - name: Install dependencies and build（安装依赖并编译）
+        env:
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+          NPM_CONFIG_FUND: "false"
+          PUPPETEER_SKIP_DOWNLOAD: "1"
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1"
+        run: |
+          set -euxo pipefail
+          npm ci --no-audit --no-fund
+          npm --prefix whatsapp-plugin ci --no-audit --no-fund
+          npm run build
+
+      # ---- 第 4 步：构建产物完整性校验 ----
+      # 与官方 build-in-docker.sh 的校验清单一致，五项缺一即中止发布：
+      #   backend/dist/server.js                        —— 后端主程序
+      #   backend/dist/migrate-mysql.js                 —— 数据库迁移脚本（compose 的 backend-migrate 用）
+      #   proforma-invoice-variable-base.xlsx           —— 形式发票文档模板（后端资源）
+      #   frontend/dist/index.html                      —— 前端页面入口（gateway 镜像内嵌）
+      #   whatsapp-plugin/dist-server/server/index.js   —— WhatsApp 插件服务入口
+      - name: Verify build outputs（校验构建产物）
+        run: |
+          test -f backend/dist/server.js
+          test -f backend/dist/migrate-mysql.js
+          test -f backend/resources/document-templates/proforma-invoice-variable-base.xlsx
+          test -f frontend/dist/index.html
+          test -f whatsapp-plugin/dist-server/server/index.js
+
+      # ---- 第 5 步：登录阿里云 ACR（香港）----
+      # 密码通过 stdin 传递（--password-stdin），不进命令行历史、不进日志
+      - name: Login to Alibaba Cloud ACR（登录镜像仓库）
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ secrets.ACR_REGISTRY }}" \
+            --username "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      # ---- 第 6 步：构建并推送三件套镜像 ----
+      # VERSION 取自触发标签：GITHUB_REF_NAME 为 v1.8.0 时，去掉前缀 v 得 1.8.0
+      # 与服务器 compose.yml 的引用方式对应：
+      #   image: ${GOODJOB_*_IMAGE}:${GOODJOB_RELEASE_ID}
+      # 每个服务打两个标签：精确版本号（回滚时用）+ latest（追踪最新）
+      # 构建参数与服务器 compose 的 build 配置一致：context 为仓库根目录，
+      # Dockerfile 分别是 deploy/docker-compose/Dockerfile.{backend,communication,gateway}
+      - name: Build and push images（构建并推送镜像）
+        env:
+          REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+        run: |
+          set -euxo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "发布版本: $VERSION"
+          # 镜像命名与官方仓库及服务器 deploy.env 保持一致：
+          #   $REGISTRY/$NAMESPACE/backend|communication|gateway（无额外前缀）
+          for SVC in backend communication gateway; do
+            IMAGE="$REGISTRY/$NAMESPACE/$SVC"
+            docker build \
+              -f "deploy/docker-compose/Dockerfile.$SVC" \
+              -t "$IMAGE:$VERSION" \
+              -t "$IMAGE:latest" \
+              .
+            docker push "$IMAGE:$VERSION"
+            docker push "$IMAGE:latest"
+          done
+
+      # ---- 第 7 步：登出仓库（无论成败都执行，清理登录凭据）----
+      - name: Logout（登出清理）
+        if: always()
+        run: docker logout "${{ secrets.ACR_REGISTRY }}" || true
