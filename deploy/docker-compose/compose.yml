@@ -1,3 +1,14 @@
+# GoodJob CRM compose（增强版）
+# 基于官方 1.7.2 compose.yml，改动两处（其余逐行保持官方原样）：
+#   改动 1【1292 修复】：mysql command 追加 --sql-mode（移除严格模式）与 --default-time-zone=+00:00。
+#     背景：应用以 ISO 时间字符串写 DATETIME，MySQL 8.4 默认严格模式（STRICT_TRANS_TABLES）
+#     会拒绝写入并导致前端报"参数格式错误"；时区统一 UTC 保证读写一致。
+#   改动 2【502 根治】：private 网络固定网段 172.18.0.0/16，并为每个容器分配固定内网 IP。
+#     背景：容器重建后 IP 随机变化，gateway/nginx 缓存旧 IP 会导致全站 502；
+#     固定 IP 后无论用宝塔还是命令行重建，IP 永不变。
+# postgres 服务保留官方 profiles: ["legacy-migration"] 限制，日常编排重建不会启动它。
+# 版本号来源：GOODJOB_RELEASE_ID（由编排 .env 注入），镜像地址来源 GOODJOB_*_IMAGE。
+
 services:
   mysql:
     image: mysql:8.4.6
@@ -23,13 +34,17 @@ services:
       # 本项目要求关闭 binlog（MySQL 8.0 起默认开启）。后端与迁移启动时会校验 @@log_bin，
       # 生产环境未关闭会拒绝启动；不要删除这一行。
       - --disable-log-bin
+      # 【1292 修复】移除严格模式（ISO 时间字符串写 DATETIME 兼容）+ 时区统一 UTC
+      - --sql-mode=ONLY_FULL_GROUP_BY,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+      - --default-time-zone=+00:00
     secrets:
       - mysql_password
       - mysql_root_password
     volumes:
       - mysql_data:/var/lib/mysql
     networks:
-      - private
+      private:
+        ipv4_address: 172.18.0.10
     expose:
       - "3306"
     healthcheck:
@@ -63,7 +78,8 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
-      - private
+      private:
+        ipv4_address: 172.18.0.11
     expose:
       - "5432"
     healthcheck:
@@ -132,7 +148,8 @@ services:
       - admin_credentials
       - crm_runtime_env
     networks:
-      - private
+      private:
+        ipv4_address: 172.18.0.12
     depends_on:
       mysql:
         condition: service_healthy
@@ -176,7 +193,8 @@ services:
       - communication_session_key
       - crm_runtime_env
     networks:
-      - private
+      private:
+        ipv4_address: 172.18.0.13
     depends_on:
       mysql:
         condition: service_healthy
@@ -194,7 +212,8 @@ services:
     environment: *backend_environment
     secrets: *backend_secrets
     networks:
-      - private
+      private:
+        ipv4_address: 172.18.0.14
     volumes:
       - uploads_data:/app/uploads
     expose:
@@ -226,7 +245,8 @@ services:
     volumes:
       - communication_media:/data/media
     networks:
-      - private
+      private:
+        ipv4_address: 172.18.0.15
     expose:
       - "3100"
     depends_on:
@@ -252,7 +272,8 @@ services:
     ports:
       - "127.0.0.1:${GOODJOB_HTTP_PORT:-4188}:8080"
     networks:
-      - private
+      private:
+        ipv4_address: 172.18.0.16
     depends_on:
       backend:
         condition: service_healthy
@@ -299,3 +320,7 @@ networks:
   private:
     name: goodjobcrm_private
     driver: bridge
+    # 【502 根治】固定网段，配合各服务 ipv4_address 实现重建后 IP 不变
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
