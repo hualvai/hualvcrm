@@ -8,9 +8,9 @@
 #   → ④ 推送到阿里云 ACR（香港）个人仓库
 #
 # 【镜像命名规则】
-#   <ACR_REGISTRY>/<ACR_NAMESPACE>/goodjobcrm-backend:<版本>
-#   <ACR_REGISTRY>/<ACR_NAMESPACE>/goodjobcrm-communication:<版本>
-#   <ACR_REGISTRY>/<ACR_NAMESPACE>/goodjobcrm-gateway:<版本>
+#   <ACR_REGISTRY>/<ACR_NAMESPACE>/backend:<版本>
+#   <ACR_REGISTRY>/<ACR_NAMESPACE>/communication:<版本>
+#   <ACR_REGISTRY>/<ACR_NAMESPACE>/gateway:<版本>
 #   （版本号取自标签，如标签 v1.8.0 → 镜像版本 1.8.0；同时额外打一个 latest）
 #
 # 【凭据来源】全部从 GitHub 仓库 Secrets 加密读取（Settings → Secrets and variables → Actions）：
@@ -113,8 +113,10 @@ jobs:
           set -euxo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           echo "发布版本: $VERSION"
+          # 镜像命名与官方仓库及服务器 deploy.env 保持一致：
+          #   $REGISTRY/$NAMESPACE/backend|communication|gateway（无额外前缀）
           for SVC in backend communication gateway; do
-            IMAGE="$REGISTRY/$NAMESPACE/goodjobcrm-$SVC"
+            IMAGE="$REGISTRY/$NAMESPACE/$SVC"
             docker build \
               -f "deploy/docker-compose/Dockerfile.$SVC" \
               -t "$IMAGE:$VERSION" \
