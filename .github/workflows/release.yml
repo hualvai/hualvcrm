@@ -2,7 +2,7 @@
 # GoodJob CRM 镜像自动发布工作流（GitHub Actions）
 # =============================================================
 # 【作用】
-#   打 v* 版本标签推送到 GitHub 后，自动在 GitHub 云端机器上完成：
+#   打 v* 版本标签推送（自动）或 Actions 页面手动触发后，在 GitHub 云端机器上完成：
 #   ① 安装依赖（npm ci）→ ② 编译构建（npm run build）
 #   → ③ 构建 backend / communication / gateway 三件套 Docker 镜像
 #   → ④ 推送到阿里云 ACR（香港）个人仓库
@@ -23,17 +23,29 @@
 # 【日常用法】
 #   代码推送后打标签：
 #     git tag v1.8.0 && git push origin v1.8.0
+#   手动触发（补位用）：
+#     GitHub 仓库页 → Actions → Release Images → Run workflow → 填版本号 → 运行
 #   然后到 GitHub 仓库页 → Actions 标签页看构建日志，全绿即镜像已入库，
-#   服务器端按《发版操作手册》改版本号 + 宝塔编排点"重建"即可完成发版。 
+#   服务器端按《发版操作手册》改版本号 + 宝塔编排点"重建"即可完成发版。
 # =============================================================
 
 name: Release Images
 
-# 触发条件：只对 v 开头的标签生效（普通 push / PR 不会触发，避免无谓消耗构建时长）
+# 触发条件（两种方式并存，互不干扰）：
+#   方式一（日常发版，推荐）：推送 v 开头的标签，自动取标签名做版本号
+#   方式二（手动补位）：Actions 页面点 "Run workflow" 手动触发，
+#     需要在 version 输入框填版本号（不带 v 前缀，如 1.8.0），
+#     构建的是所选分支/标签的代码，适合标签打错重推、测试 Secrets 等
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "镜像版本号（不带 v 前缀，如 1.8.0 或 1.8.0-test.1）"
+        required: true
+        type: string
 
 # 最小权限原则：构建流程只需要读代码
 permissions:
@@ -99,7 +111,7 @@ jobs:
             --username "${{ secrets.ACR_USERNAME }}" --password-stdin
 
       # ---- 第 6 步：构建并推送三件套镜像 ----
-      # VERSION 取自触发标签：GITHUB_REF_NAME 为 v1.8.0 时，去掉前缀 v 得 1.8.0
+      # VERSION 取值：手动触发用输入的版本号；标签触发用标签名（GITHUB_REF_NAME 为 v1.8.0 时去前缀得 1.8.0）
       # 与服务器 compose.yml 的引用方式对应：
       #   image: ${GOODJOB_*_IMAGE}:${GOODJOB_RELEASE_ID}
       # 每个服务打两个标签：精确版本号（回滚时用）+ latest（追踪最新）
@@ -109,9 +121,17 @@ jobs:
         env:
           REGISTRY: ${{ secrets.ACR_REGISTRY }}
           NAMESPACE: ${{ secrets.ACR_NAMESPACE }}
+          # 手动触发时取 inputs.version；标签触发时此值为空，回退到标签名（GITHUB_REF_NAME，如 v1.8.0）
+          MANUAL_VERSION: ${{ inputs.version || '' }}
         run: |
           set -euxo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          # 版本号取值优先级：手动输入 > 标签名去 v 前缀
+          VERSION="${MANUAL_VERSION:-${GITHUB_REF_NAME#v}}"
+          # 兜底校验：版本号不能为空、不能是分支名（分支名会被误当版本推错镜像）
+          if [ -z "$VERSION" ] || [ "$VERSION" = "master" ] || [ "$VERSION" = "develop" ]; then
+            echo "::error::版本号无效：'$VERSION'。手动触发请填写 version 输入框；标签触发请使用 v* 标签。"
+            exit 1
+          fi
           echo "发布版本: $VERSION"
           # 镜像命名与官方仓库及服务器 deploy.env 保持一致：
           #   $REGISTRY/$NAMESPACE/backend|communication|gateway（无额外前缀）
